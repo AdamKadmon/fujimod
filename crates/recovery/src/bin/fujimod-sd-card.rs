@@ -61,6 +61,35 @@ fn take_fallback_wait(
     Ok(Some(value))
 }
 
+/// Remove `--destination ADDRESS` from the arguments (`sd-boot-v1-read-only-startup` requires it, no
+/// other command takes it). ADDRESS is decimal or `0x` hexadecimal.
+fn take_destination(
+    args: &mut Vec<String>,
+    allowed: bool,
+) -> Result<Option<u64>, Box<dyn std::error::Error>> {
+    let Some(at) = args.iter().position(|arg| arg == "--destination") else {
+        return if allowed {
+            Err("sd-boot-v1-read-only-startup requires --destination ADDRESS".into())
+        } else {
+            Ok(None)
+        };
+    };
+    if !allowed {
+        return Err("--destination requires sd-boot-v1-read-only-startup".into());
+    }
+    let text = args.get(at + 1).ok_or("Missing --destination value")?;
+    let value = match text.strip_prefix("0x") {
+        Some(hex) => u64::from_str_radix(hex, 16),
+        None => text.parse::<u64>(),
+    }
+    .map_err(|_| "--destination requires an address, decimal or 0x hexadecimal")?;
+    args.drain(at..=at + 1);
+    if args.iter().any(|arg| arg == "--destination") {
+        return Err("--destination was specified twice".into());
+    }
+    Ok(Some(value))
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -77,7 +106,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(
             command @ ("sd-card-recovery-build" | "green-led" | "sd-boot-v1-startup" | "sd-boot-v1-sd-card-startup" | "sd-boot-v1-stage-one"
-            | "sd-boot-v1-ram-startup" | "sd-card-recovery-baseline" | "sd-boot-v2-sd-card"),
+            | "sd-boot-v1-ram-startup" | "sd-boot-v1-read-only-startup" | "sd-card-recovery-baseline" | "sd-boot-v2-sd-card"),
         ) => {
             let mut inputs = args[1..].to_vec();
             let storage = if command == "sd-boot-v1-sd-card-startup" {
@@ -90,12 +119,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let fallback_wait_seconds =
                 take_fallback_wait(&mut inputs, command == "sd-boot-v1-ram-startup")?;
+            let read_only_destination =
+                take_destination(&mut inputs, command == "sd-boot-v1-read-only-startup")?;
             let (firmware, dat, output, success_hold_seconds) =
-                construction_args(&inputs, matches!(command, "sd-boot-v1-startup" | "sd-boot-v1-stage-one" | "sd-boot-v1-ram-startup"))?;
+                construction_args(&inputs, matches!(command, "sd-boot-v1-startup" | "sd-boot-v1-stage-one" | "sd-boot-v1-ram-startup" | "sd-boot-v1-read-only-startup"))?;
             let options = StartupOptions {
                 success_hold_seconds,
                 internal_flash: command == "sd-boot-v1-ram-startup",
                 fallback_wait_seconds,
+                read_only_destination,
             };
             let recipe = Recipe::bundled(firmware)?.ok_or("Missing SD card recipe")?;
             let source = fs::read(dat)?;
@@ -111,7 +143,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 recipe.build_ota_startup(&source)?
             } else if command == "sd-boot-v1-stage-one" {
                 recipe.build_stage_one_with_options(&source, options)?
-            } else if command == "sd-boot-v1-ram-startup" {
+            } else if matches!(command, "sd-boot-v1-ram-startup" | "sd-boot-v1-read-only-startup") {
                 // The update stays an independent input and is not written.
                 recipe.build_boot_files(&source, options)?
             } else {
@@ -128,7 +160,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => {
             return Err(
-                "Usage: fujimod-sd-card list | sd-card-recovery-build|green-led|sd-boot-v1-startup|sd-boot-v1-stage-one|sd-boot-v1-ram-startup|sd-card-recovery-baseline|sd-boot-v2-sd-card FIRMWARE DAT NEW_DIRECTORY [--success-hold-seconds N] [--fallback-wait-seconds N (sd-boot-v1-ram-startup)] | sd-boot-v1-sd-card-startup FIRMWARE DAT STORAGE_IMAGE NEW_DIRECTORY"
+                "Usage: fujimod-sd-card list | sd-card-recovery-build|green-led|sd-boot-v1-startup|sd-boot-v1-stage-one|sd-boot-v1-ram-startup|sd-boot-v1-read-only-startup|sd-card-recovery-baseline|sd-boot-v2-sd-card FIRMWARE DAT NEW_DIRECTORY [--success-hold-seconds N] [--fallback-wait-seconds N (sd-boot-v1-ram-startup)] [--destination ADDRESS (sd-boot-v1-read-only-startup, required)] | sd-boot-v1-sd-card-startup FIRMWARE DAT STORAGE_IMAGE NEW_DIRECTORY"
                     .into(),
             );
         }
@@ -138,7 +170,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{construction_args, take_fallback_wait};
+    use super::{construction_args, take_destination, take_fallback_wait};
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|s| s.to_string()).collect()
     }
@@ -161,6 +193,27 @@ mod tests {
         assert!(
             take_fallback_wait(&mut args(&["--fallback-wait-seconds", "1"]), false).is_err()
         );
+    }
+    #[test]
+    fn destination_is_required_by_the_read_only_command_and_by_no_other() {
+        let mut values = args(&["--destination", "0x20000000", "camera", "update", "output"]);
+        assert_eq!(take_destination(&mut values, true).unwrap(), Some(0x2000_0000));
+        assert_eq!(values, args(&["camera", "update", "output"]));
+        let mut values = args(&["camera", "update", "output", "--destination", "536870912"]);
+        assert_eq!(take_destination(&mut values, true).unwrap(), Some(0x2000_0000));
+        assert_eq!(values, args(&["camera", "update", "output"]));
+        assert_eq!(take_destination(&mut args(&["camera", "update", "output"]), false).unwrap(), None);
+        assert!(take_destination(&mut args(&["camera", "update", "output"]), true).is_err());
+        assert!(take_destination(&mut args(&["--destination", "0x2000"]), false).is_err());
+        for bad in [
+            args(&["camera", "--destination"]),
+            args(&["camera", "--destination", "-1"]),
+            args(&["camera", "--destination", "0xzz"]),
+            args(&["camera", "--destination", "x"]),
+            args(&["--destination", "0x1000", "--destination", "0x2000"]),
+        ] {
+            assert!(take_destination(&mut bad.clone(), true).is_err(), "{bad:?}");
+        }
     }
     #[test]
     fn success_hold_defaults_to_zero_and_accepts_either_position() {

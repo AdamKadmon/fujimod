@@ -230,7 +230,23 @@ every other failure without an armed fallback halts with the cores held and the 
 restore that does not verify (`-106`) halts with the gate still in place. The loader records the status of the fallback and
 the CRCs it measured in the last words of its binding.
 
-`sd-boot-v1-startup`, `sd-boot-v1-ram-startup` and `sd-boot-v1-stage-one` accept `--success-hold-seconds N` (default `0`).
+`sd-boot-v1-read-only-startup FIRMWARE DAT NEW_DIRECTORY --destination ADDRESS` (XP5) writes the same two
+files, `marble_init.bin` and `ffboot.bin`, and never the update, for a card that only *reads*
+`ffboot.bin`. `ffboot.bin` is the file the internal-flash startup builds, byte for byte (the image
+is never run). The loader (`assets/sd-boot-v1-xp5-read-only-loader.generated.{bin,json}`, the same
+sources compiled with `-DXP5_READ_ONLY_STARTUP`) runs in place of the stock initializer's call:
+the stock initializer runs first and unchanged, then the loader streams the whole file into DRAM
+at `ADDRESS` (decimal or `0x`; `StartupOptions::read_only_destination` in the library), checks its
+length and CRC-32 and returns, and the stock bootstrap goes on from the installed flash exactly as
+on a normal boot. The bootstrap's continuation is not touched, RAM 0 is never written, no core is
+held or woken and nothing read is run. The destination must be 4 KiB aligned with the whole file
+inside `0x10000000..0x80000000` (the loader refuses a bound outside that and so does the
+packager). A failed read (no file, a length or CRC mismatch, a read error) is recorded in the
+loader's progress words and shown as red lamp blinks, and the stock boot continues all the same.
+The command excludes `--fallback-wait-seconds`, takes no storage image and needs no card-resident
+setup in the recipe.
+
+`sd-boot-v1-startup`, `sd-boot-v1-ram-startup`, `sd-boot-v1-read-only-startup` and `sd-boot-v1-stage-one` accept `--success-hold-seconds N` (default `0`).
 After sampling and header operations succeed, a nonzero value holds steady
 green using a counted loop before continuing. Each second requests 2,048 units
 of 1,000,000 four-NOP iterations, allowing up to two billion iterations per
