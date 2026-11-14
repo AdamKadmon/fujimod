@@ -527,7 +527,7 @@ fn bind_read_only(
         "The read-only destination is outside the DRAM the loader may fill",
     )?;
     require(
-        setup.reset_copy_size > 0
+        setup.reset_copy_size >= 8
             && setup.reset_copy_size <= 0x10_0000
             && setup.reset_copy_size % 4 == 0
             && setup.selector % 4 == 0
@@ -1565,6 +1565,26 @@ mod tests {
             u64::MAX,
         ] {
             assert!(package_read_only(&data, &s, ram.clone(), 0, bad).is_err(), "{bad:#x}");
+        }
+    }
+
+    #[test]
+    fn the_read_only_guard_needs_a_reset_image_that_holds_its_selector_word() {
+        let (data, s, ram) = fixture();
+        assert!(package_read_only(&data, &s, ram.clone(), 0, 0x3000_0000).is_ok());
+        // A guard shorter than the 8-byte selector word cannot hold it (the loader would
+        // underflow `guard_bytes - 8`), whatever else is true of the image.
+        for size in [0usize, 4, 7] {
+            let mut short = s.clone();
+            short.reset_copy_size = size;
+            assert!(package_read_only(&data, &short, ram.clone(), 0, 0x3000_0000).is_err(), "{size}");
+        }
+        // The selector word has to lie wholly inside the guarded extent and be word aligned.
+        for (selector, size) in [(0x40usize, 0x44usize), (0x42, 0x1000), (0xff8, 0x1000)] {
+            let mut odd = s.clone();
+            odd.selector = selector;
+            odd.reset_copy_size = size;
+            assert!(package_read_only(&data, &odd, ram.clone(), 0, 0x3000_0000).is_err(), "{selector:#x} {size:#x}");
         }
     }
 
