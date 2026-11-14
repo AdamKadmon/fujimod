@@ -21,6 +21,22 @@ pub use xp5::{
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct StartupOptions {
     pub success_hold_seconds: u32,
+    /// Hold length in loop units instead of seconds (2,048 units per second).
+    /// Mutually exclusive with a nonzero `success_hold_seconds`.
+    pub success_hold_units: Option<u64>,
+}
+
+impl StartupOptions {
+    /// The hold in loop units of 1,000,000 four-NOP iterations.
+    pub fn hold_units(&self) -> Result<u64> {
+        require(
+            self.success_hold_units.is_none() || self.success_hold_seconds == 0,
+            "Success hold takes seconds or units, not both",
+        )?;
+        Ok(self
+            .success_hold_units
+            .unwrap_or(u64::from(self.success_hold_seconds) * 2_048))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -255,7 +271,7 @@ impl Recipe {
             &fujimod_firmware::invert(source),
             setup,
             None,
-            options.success_hold_seconds,
+            options.hold_units()?,
         )
     }
     /// Boot files retain the stock updater and storage drivers. DAT is copied
@@ -284,7 +300,7 @@ impl Recipe {
         options: StartupOptions,
     ) -> Result<Vec<File>> {
         require(
-            options.success_hold_seconds == 0 || matches!(self.generation, Generation::Xp5),
+            options.hold_units()? == 0 || matches!(self.generation, Generation::Xp5),
             "Success hold requires XP5",
         )?;
         require(
@@ -353,7 +369,7 @@ impl Recipe {
                         &inverted,
                         setup,
                         Some(image::transform(&inverted, plan)?),
-                        options.success_hold_seconds,
+                        options.hold_units()?,
                     )?
                 }
             };

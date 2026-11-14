@@ -180,7 +180,7 @@ pub fn package(
     inverted: &[u8],
     setup: &Setup,
     ram: Option<Vec<u8>>,
-    success_hold_seconds: u32,
+    success_hold_units: u64,
 ) -> Result<Vec<File>> {
     let prefix = setup.verify(inverted)?;
     let copied_end = setup.base + setup.low_length as u64;
@@ -288,9 +288,10 @@ pub fn package(
     put64(
         &mut program,
         cfg + 192,
-        // Each unit executes 1,000,000 four-NOP iterations. Even allowing
-        // two billion iterations per second, 2,048 units take >= 1.024 s.
-        u64::from(success_hold_seconds) * 2_048,
+        // Each unit executes 1,000,000 four-NOP iterations. Callers that ask
+        // for seconds pass 2,048 units per second (>= 1.024 s even at two
+        // billion iterations per second).
+        success_hold_units,
     )?;
     let restore = template::XP5_FLASH_SETUP_BRANCH;
     require(
@@ -585,10 +586,10 @@ mod tests {
             let normal = package(&data, &s, payload.clone(), 0).unwrap();
             let at = 0xc000 + template::XP5_FLASH_CONFIGURATION + 192;
             assert_eq!(&normal[0].bytes[at..at + 8], &[0; 8]);
-            for seconds in [1, 3, u32::MAX] {
-                let held = package(&data, &s, payload.clone(), seconds).unwrap();
+            for units in [1, 32, 6_144, u64::from(u32::MAX) * 2_048] {
+                let held = package(&data, &s, payload.clone(), units).unwrap();
                 let mut expected = normal[0].bytes.clone();
-                put64(&mut expected, at, u64::from(seconds) * 2_048).unwrap();
+                put64(&mut expected, at, units).unwrap();
                 assert_eq!(expected, held[0].bytes);
                 if normal.len() == 2 {
                     assert_eq!(normal[1].bytes, held[1].bytes);
