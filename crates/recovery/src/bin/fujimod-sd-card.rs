@@ -196,11 +196,11 @@ mod tests {
     }
     #[test]
     fn destination_is_required_by_the_read_only_command_and_by_no_other() {
-        let mut values = args(&["--destination", "0x20000000", "camera", "update", "output"]);
-        assert_eq!(take_destination(&mut values, true).unwrap(), Some(0x2000_0000));
+        let mut values = args(&["--destination", "0x30000000", "camera", "update", "output"]);
+        assert_eq!(take_destination(&mut values, true).unwrap(), Some(0x3000_0000));
         assert_eq!(values, args(&["camera", "update", "output"]));
-        let mut values = args(&["camera", "update", "output", "--destination", "536870912"]);
-        assert_eq!(take_destination(&mut values, true).unwrap(), Some(0x2000_0000));
+        let mut values = args(&["camera", "update", "output", "--destination", "805306368"]);
+        assert_eq!(take_destination(&mut values, true).unwrap(), Some(0x3000_0000));
         assert_eq!(values, args(&["camera", "update", "output"]));
         assert_eq!(take_destination(&mut args(&["camera", "update", "output"]), false).unwrap(), None);
         assert!(take_destination(&mut args(&["camera", "update", "output"]), true).is_err());

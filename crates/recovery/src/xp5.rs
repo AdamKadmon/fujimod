@@ -111,9 +111,11 @@ const READ_ONLY: Loader = Loader {
     read_only_binding: Some(read_only_template::SETUP_SD_READ_ONLY),
 };
 /// The DRAM a read-only startup may fill: the same two numbers as `READ_ONLY_FLOOR` and
-/// `READ_ONLY_CEILING` in the loader source `read_only.h`, which refuses anything else.
-pub const READ_ONLY_FLOOR: u64 = 0x1000_0000;
-pub const READ_ONLY_CEILING: u64 = 0x8000_0000;
+/// `READ_ONLY_CEILING` in the loader source `read_only.h`, which refuses anything else. It is the
+/// gap that a boot of the X100VI 1.31 firmware to its shooting screen never touches (found in the
+/// emulator); the X-T5's `0x20000000` is below it, among the firmware's own buffers.
+pub const READ_ONLY_FLOOR: u64 = 0x2445_9000;
+pub const READ_ONLY_CEILING: u64 = 0x3e40_8000;
 /// Longest wait of the load-failure fallback; the loader refuses a binding above it.
 const MAX_FALLBACK_WAIT_SECONDS: u32 = 86_400;
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -359,22 +361,36 @@ pub(crate) fn package_internal_flash(
 }
 
 /// A startup that only reads: the loader streams `ffboot.bin` into spare DRAM at `destination`,
-/// checks its length and CRC-32 and goes back to the stock bootstrap, which then starts from
-/// the installed flash as on a normal boot. The loader writes no RAM 0, holds and gates no core
-/// and executes nothing it read. The image carries the same RAM edits an internal-flash startup
-/// does (the file is the same; it is never run). The stock continuation is left in place. A
-/// failed read is shown on the lamp and the stock boot goes on all the same.
+/// checks its length and CRC-32, reads the DRAM back and checks it again, and goes back to the
+/// stock bootstrap, which then starts from the installed flash as on a normal boot. The loader
+/// writes no RAM 0, holds and gates no core and executes nothing it read; it halts if RAM 0 changed
+/// while it ran. `ffboot.bin` is the RAM image as the stock update installs it: the recipe's plan
+/// with its preloaded-selector edit undone (selector 1) and no RAM edits, so its reset-image prefix
+/// is byte for byte the stock reset image in the flash. The stock continuation is left in place.
+/// A failed read is shown on the lamp and the stock boot goes on all the same.
 pub(crate) fn package_read_only(
     inverted: &[u8], setup: &Setup, ram: Vec<u8>, success_hold_seconds: u32, destination: u64,
 ) -> Result<Vec<File>> {
     let mut setup = setup.clone();
-    let ram_edits = std::mem::take(&mut setup.internal_flash_ram_edits);
+    // The RAM edits are for a card that runs the image; this one only reads it.
+    setup.internal_flash_ram_edits = Vec::new();
     // Nothing of the card-resident setup is used: no tables, no unit cache, no interrupt frames.
     setup.card_boot = None;
     setup.banks = Banks {
         copies: Vec::new(),
         edits: Vec::new(),
     };
+    // The plan's only edit of the reset image is the preloaded selector; give the stock word back.
+    let mut ram = ram;
+    let stock = extent(inverted, setup.reset_dat, setup.reset_copy_size)?;
+    require(
+        setup.selector.checked_add(8).is_some_and(|end| end <= setup.reset_copy_size)
+            && setup.reset_copy_size <= ram.len()
+            && word(&ram, setup.selector)? == 0
+            && word(&ram, setup.selector + 4)? == 0,
+        "XP5 RAM image does not carry the preloaded selector",
+    )?;
+    ram[setup.selector..setup.selector + 8].copy_from_slice(&stock[setup.selector..setup.selector + 8]);
     package_inner(
         inverted,
         &setup,
@@ -382,10 +398,7 @@ pub(crate) fn package_read_only(
         success_hold_seconds,
         None,
         None,
-        Some(ReadOnly {
-            destination,
-            ram_edits,
-        }),
+        Some(ReadOnly { destination }),
     )
 }
 
@@ -394,8 +407,6 @@ pub(crate) fn package_read_only(
 struct ReadOnly {
     /// DRAM address the loader streams the file to.
     destination: u64,
-    /// Word edits of the RAM image, as for an internal-flash startup (the file is the same).
-    ram_edits: Vec<image::Edit>,
 }
 
 /// How an internal-flash startup differs from a card-resident one.
@@ -494,16 +505,18 @@ fn bind_internal_flash(
     Ok(())
 }
 
-/// Fill the read-only loader binding: where in DRAM the file goes. The loader refuses a bound
-/// outside its own floor and ceiling, and so does the packager, before any file is written.
+/// Fill the read-only loader binding: where in DRAM the file goes, and what the RAM-0 guard
+/// covers (the stock reset image's extent and its selector word). The loader refuses a bound
+/// outside its own floor and ceiling, and so does the packager, before any file is written. The
+/// last five words are the loader's own outputs.
 fn bind_read_only(
-    program: &mut [u8], loader: &Loader, read_only: &ReadOnly, bytes: usize,
+    program: &mut [u8], loader: &Loader, setup: &Setup, read_only: &ReadOnly, bytes: usize,
 ) -> Result<()> {
     let at = loader.read_only_binding.ok_or_else(|| {
         image::Error::Invalid("This XP5 loader build has no read-only binding".into())
     })?;
     require(
-        extent(program, at, 16)? == [1u64, 0].map(u64::to_le_bytes).concat(),
+        extent(program, at, 72)? == [1u64, 0, 0, 0, 0, 0, 0, 0, 0].map(u64::to_le_bytes).concat(),
         "XP5 read-only binding template changed",
     )?;
     let destination = read_only.destination;
@@ -513,7 +526,21 @@ fn bind_read_only(
             && bytes as u64 <= READ_ONLY_CEILING - destination,
         "The read-only destination is outside the DRAM the loader may fill",
     )?;
-    put64(program, at + 8, destination)
+    require(
+        setup.reset_copy_size > 0
+            && setup.reset_copy_size <= 0x10_0000
+            && setup.reset_copy_size % 4 == 0
+            && setup.selector % 4 == 0
+            && setup.selector + 8 <= setup.reset_copy_size,
+        "The read-only guard does not fit the stock reset image",
+    )?;
+    for (n, value) in [destination, setup.reset_copy_size as u64, setup.selector as u64]
+        .into_iter()
+        .enumerate()
+    {
+        put64(program, at + 8 + n * 8, value)?;
+    }
+    Ok(())
 }
 
 fn package_inner(
@@ -667,7 +694,7 @@ fn package_inner(
     }
     if let Some(read_only) = &read_only {
         let bytes = ram.as_ref().map_or(0, Vec::len);
-        bind_read_only(&mut program, loader, read_only, bytes)?;
+        bind_read_only(&mut program, loader, setup, read_only, bytes)?;
     }
     let restore = loader.setup_return_branch;
     require(
@@ -717,16 +744,16 @@ fn package_inner(
             word(&reset, setup.selector)? == 1 && word(&reset, setup.selector + 4)? == 0,
             "XP5 stock reset selector differs",
         )?;
-        put64(&mut reset, setup.selector, 0)?;
+        // The read-only startup keeps the stock selector in its image.
+        if read_only.is_none() {
+            put64(&mut reset, setup.selector, 0)?;
+        }
         require(
             reset == ram[..setup.reset_copy_size],
             "XP5 reset copy differs beyond preloaded selector",
         )?;
         if let Some(flash) = &internal_flash {
             edit_ram(&mut ram, &flash.ram_edits, setup.selector)?;
-        }
-        if let Some(read_only) = &read_only {
-            edit_ram(&mut ram, &read_only.ram_edits, setup.selector)?;
         }
         require(
             word(&prefix, setup.bootstrap_offset + 36)?
@@ -804,8 +831,9 @@ fn package_inner(
             (call - setup.base) as usize,
             branch(call, address + loader.sd_initialize as u64, true)?,
         )?;
-        // The read-only startup leaves the stock continuation (`ldr x30, =0; ret`) alone: nothing
-        // is written to RAM 0, so there is nothing to gate.
+        // The read-only startup leaves the stock continuation alone (the bootstrap's
+        // `ldr x30, =0xf0027110; ret` into the flash, whose Aff0-zero path loads zero and
+        // returns to RAM 0): nothing is written to RAM 0, so there is nothing to gate.
         if read_only.is_none() {
             put(
                 &mut raw,
@@ -1394,7 +1422,7 @@ mod tests {
             t::XP5_SETUP_CONFIGURATION..t::XP5_SETUP_CONFIGURATION + 208,
             t::SETUP_SD_BOARD..t::SETUP_SD_BOARD + 16 + 32 * 24,
             t::SETUP_SD_REQUEST..t::SETUP_SD_REQUEST + 40,
-            t::SETUP_SD_READ_ONLY..t::SETUP_SD_READ_ONLY + 16,
+            t::SETUP_SD_READ_ONLY..t::SETUP_SD_READ_ONLY + 72,
             t::XP5_SETUP_RETURN_BRANCH..t::XP5_SETUP_RETURN_BRANCH + 4,
         ];
         ranges.extend(t::EXTERNALS.iter().map(|&(at, _, _)| at..at + 4));
@@ -1410,19 +1438,29 @@ mod tests {
         let address = s.base + 0xc000;
         // The recipe's card-resident setup (interrupt frames) is not needed and not used.
         for setup in [s.clone(), with_frames(s.clone())] {
-            for destination in [READ_ONLY_FLOOR, 0x2000_0000, READ_ONLY_CEILING - 0x1000] {
+            for destination in [READ_ONLY_FLOOR, 0x3000_0000, READ_ONLY_CEILING - 0x1000] {
                 let files = package_read_only(&data, &setup, ram.clone(), 0, destination).unwrap();
                 assert_eq!(
                     files.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
                     ["marble_init.bin", "ffboot.bin"]
                 );
                 let raw = &files[0].bytes;
-                assert_eq!(files[1].bytes, ram);
+                // The RAM image as the update installs it: the stock selector, no edits, so its
+                // reset-image prefix is the stock reset image byte for byte.
+                assert_eq!(files[1].bytes, data[0x40000..0x41000].to_vec());
+                assert_ne!(files[1].bytes, ram);
                 assert!(raw.len() <= 0x38800);
                 let field = |n: usize| u64::from_le_bytes(raw[at + 8 * n..at + 8 * n + 8].try_into().unwrap());
-                assert_eq!((field(0), field(1)), (1, destination));
+                // The binding: the destination, then what the RAM-0 guard covers (the stock reset
+                // image's extent and its selector word); the loader's five output words start empty.
+                assert_eq!(
+                    (0..4).map(field).collect::<Vec<_>>(),
+                    [1, destination, s.reset_copy_size as u64, s.selector as u64]
+                );
+                assert!((4..9).all(|n| field(n) == 0));
                 // The stock initializer's call goes to the loader; the stock continuation
-                // (`ldr x30, =0; ret`) is untouched, so no gate waits and nothing goes to RAM 0.
+                // (`ldr x30, =0xf0027110; ret`, into the flash) is untouched, so no gate waits
+                // and nothing goes to RAM 0.
                 assert_eq!(
                     word(raw, call).unwrap(),
                     branch(
@@ -1442,7 +1480,7 @@ mod tests {
                     u64::from_le_bytes(raw[request + 8..request + 16].try_into().unwrap()),
                     ram.len() as u64
                 );
-                assert_eq!(word(raw, request + 16).unwrap(), crate::xp4::crc32(&ram));
+                assert_eq!(word(raw, request + 16).unwrap(), crate::xp4::crc32(&files[1].bytes));
                 // The loader is the compiled read-only build: nothing outside the bound ranges
                 // differs from it, and nothing is appended.
                 let bound = read_only_bound_ranges();
@@ -1460,16 +1498,19 @@ mod tests {
                 assert!(raw[header + 0x800..].iter().all(|&byte| byte == 0xff));
             }
         }
-        // The same image as an internal-flash startup builds, byte for byte: the file is the
-        // same and is never run.
+        // Unlike an internal-flash startup's image, which carries the preloaded selector and the
+        // recipe's edits so that it could run, this one differs from it by exactly those.
         let flash = package_internal_flash(&data, &with_frames(s.clone()), ram.clone(), 0, None).unwrap();
-        let only = package_read_only(&data, &s, ram.clone(), 0, 0x2000_0000).unwrap();
-        assert_eq!(flash[1].bytes, only[1].bytes);
+        let only = package_read_only(&data, &s, ram.clone(), 0, 0x3000_0000).unwrap();
+        assert_eq!(flash[1].bytes, ram);
+        let differing: Vec<usize> =
+            (0..ram.len()).filter(|&n| flash[1].bytes[n] != only[1].bytes[n]).collect();
+        assert_eq!(differing, [s.selector]);
         assert_ne!(flash[0].bytes, only[0].bytes);
     }
 
     #[test]
-    fn the_read_only_startup_applies_the_recipes_ram_edits_like_the_internal_flash_one() {
+    fn the_read_only_startup_ignores_the_recipes_ram_edits_and_keeps_the_stock_selector() {
         let (data, s, ram) = fixture();
         let mut setup = s.clone();
         setup.internal_flash_ram_edits = vec![image::Edit {
@@ -1478,15 +1519,21 @@ mod tests {
             new: 0x1400_0068,
             what: "branch to the retained-metadata path".into(),
         }];
-        let only = package_read_only(&data, &setup, ram.clone(), 0, 0x2000_0000).unwrap();
-        let flash = package_internal_flash(&data, &with_frames(setup.clone()), ram.clone(), 0, None).unwrap();
-        assert_eq!(only[1].bytes, flash[1].bytes);
-        assert_ne!(only[1].bytes, ram);
+        let only = package_read_only(&data, &setup, ram.clone(), 0, 0x3000_0000).unwrap();
+        let plain = package_read_only(&data, &s, ram.clone(), 0, 0x3000_0000).unwrap();
+        assert_eq!(only[1].bytes, plain[1].bytes);
+        assert_eq!(only[1].bytes, data[0x40000..0x41000].to_vec());
+        assert_eq!(only[0].bytes, plain[0].bytes);
         let request = 0xc000 + read_only_template::SETUP_SD_REQUEST;
         assert_eq!(word(&only[0].bytes, request + 16).unwrap(), crate::xp4::crc32(&only[1].bytes));
-        // A changed old word refuses.
-        setup.internal_flash_ram_edits[0].old = 0x1234_5678;
-        assert!(package_read_only(&data, &setup, ram, 0, 0x2000_0000).is_err());
+        // An image that does not carry the preloaded selector (so is not the plan's) refuses, and
+        // so does one whose reset prefix differs from the stock image anywhere else.
+        let mut stock_selector = ram.clone();
+        put64(&mut stock_selector, s.selector, 1).unwrap();
+        assert!(package_read_only(&data, &s, stock_selector, 0, 0x3000_0000).is_err());
+        let mut changed = ram.clone();
+        changed[0x100] ^= 1;
+        assert!(package_read_only(&data, &s, changed, 0, 0x3000_0000).is_err());
     }
 
     #[test]
@@ -1494,16 +1541,21 @@ mod tests {
         let (data, s, ram) = fixture();
         let size = ram.len() as u64;
         assert_eq!(size, 0x1000);
-        for good in [READ_ONLY_FLOOR, READ_ONLY_CEILING - size, 0x2000_0000] {
+        assert_eq!((READ_ONLY_FLOOR, READ_ONLY_CEILING), (0x2445_9000, 0x3e40_8000));
+        for good in [READ_ONLY_FLOOR, READ_ONLY_CEILING - size, 0x3000_0000] {
             assert!(package_read_only(&data, &s, ram.clone(), 0, good).is_ok(), "{good:#x}");
         }
         for bad in [
             0,
             0x1000,
             0x0690_f000,
+            // the X-T5's address, where the X100VI keeps live-view buffers, and the first
+            // megabytes above the stock RAM image
+            0x2000_0000,
+            0x1000_0000,
             READ_ONLY_FLOOR - 0x1000,
             // not 4 KiB aligned
-            0x2000_0004,
+            0x3000_0004,
             0x2000_0800,
             // the file would run past the ceiling, or start at or beyond it
             READ_ONLY_CEILING - size + 0x1000,
@@ -1521,8 +1573,8 @@ mod tests {
         use read_only_template as t;
         assert_eq!(t::SETUP_SD_READ_ONLY % 8, 0);
         assert_eq!(
-            &t::IMAGE[t::SETUP_SD_READ_ONLY..t::SETUP_SD_READ_ONLY + 16],
-            [1u64, 0].map(u64::to_le_bytes).concat()
+            &t::IMAGE[t::SETUP_SD_READ_ONLY..t::SETUP_SD_READ_ONLY + 72],
+            [1u64, 0, 0, 0, 0, 0, 0, 0, 0].map(u64::to_le_bytes).concat()
         );
         assert_eq!(READ_ONLY.read_only_binding, Some(t::SETUP_SD_READ_ONLY));
         assert_eq!((CARD.read_only_binding, INTERNAL_FLASH.read_only_binding), (None, None));
@@ -1573,7 +1625,7 @@ mod tests {
         });
         recipe.xp5 = Some(s);
         let options = StartupOptions {
-            read_only_destination: Some(0x2000_0000),
+            read_only_destination: Some(0x3000_0000),
             ..StartupOptions::default()
         };
         let names = |files: &[File]| files.iter().map(|f| f.name.clone()).collect::<Vec<_>>();
@@ -1590,7 +1642,7 @@ mod tests {
             StartupOptions { internal_flash: true, ..options },
             StartupOptions { fallback_wait_seconds: Some(1), ..options },
             StartupOptions { read_only_destination: Some(0x1000), ..options },
-            StartupOptions { read_only_destination: Some(0x2000_0004), ..options },
+            StartupOptions { read_only_destination: Some(0x3000_0004), ..options },
             StartupOptions { read_only_destination: Some(READ_ONLY_CEILING), ..options },
         ] {
             assert!(recipe.build_boot_files(&update, other).is_err(), "{other:?}");
